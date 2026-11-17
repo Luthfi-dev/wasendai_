@@ -319,6 +319,19 @@ export interface SuperadminWaQueueItem {
   created_at: string;
 }
 
+export interface PendingSessionExpiryAlert {
+  id: string;
+  key: string;
+  user_id: string;
+  session_id: string;
+  session_name?: string;
+  expired_phone?: string;
+  first_detected_at: string;
+  notify_after: string;
+  reason?: string;
+  updated_at: string;
+}
+
 export interface RemoteBotChallenge {
   user_phone: string;
   user_id: string;

@@ -43,6 +43,10 @@ import {
   hasSessionExpiryAlertSent,
   markSessionExpiryAlertSent,
   clearSessionExpiryAlertSent,
+  getPendingSessionExpiryAlerts,
+  upsertPendingSessionExpiryAlert,
+  removePendingSessionExpiryAlert,
+  clearPendingSessionExpiryAlertsByKeys,
   getUserAutoReplyStatus
 } from './db.js';
 import {
@@ -160,8 +164,9 @@ const AUTH_BACKUP_DEBOUNCE_MS = 30000;
 const AUTH_BACKUP_COOLDOWN_MS = 120000;
 const PRUNE_COOLDOWN_MS = 90000;
 const MYSQL_AUTH_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
+const SESSION_EXPIRY_ALERT_GRACE_MS = 60 * 60 * 1000; // Tunggu 1 jam sebelum kirim WA pengingat kedaluwarsa
 
-function clearSessionExpiryNotificationCooldown(sessionId: string, ownerUserId?: string, phone?: string) {
+export function clearSessionExpiryNotificationCooldown(sessionId: string, ownerUserId?: string, phone?: string) {
   const cleanPhone = normalizePhoneNumber(phone || '');
   const keysToClear: string[] = [];
   if (sessionId) keysToClear.push(sessionId);
@@ -170,6 +175,89 @@ function clearSessionExpiryNotificationCooldown(sessionId: string, ownerUserId?:
     if (cleanPhone) keysToClear.push(`${ownerUserId}:${cleanPhone}`);
   }
   clearSessionExpiryAlertSent(keysToClear);
+  clearPendingSessionExpiryAlertsByKeys({
+    userId: ownerUserId,
+    sessionId,
+    phone: cleanPhone
+  });
+}
+
+function verifyExpiredAlertState(params: {
+  userId: string;
+  sessionId: string;
+  expiredPhone?: string;
+}): 'expired' | 'recovered' | 'wait' {
+  const owner = getUserById(params.userId);
+  if (!isOwnerActiveAndRegistered(owner)) {
+    return 'recovered';
+  }
+
+  const now = Date.now();
+  const cleanPhone = normalizePhoneNumber(params.expiredPhone || '');
+
+  // 1. Check live in-memory sockets for this user
+  for (const s of activeSessions.values()) {
+    const ownerMatch =
+      s.userId === owner!.id ||
+      isSessionOwnedByUserId(s.sessionId, owner!.id) ||
+      Boolean(getSessionById(s.sessionId)?.user_id === owner!.id);
+    if (!ownerMatch) continue;
+
+    const memPhone = normalizePhoneNumber(s.phoneNumber || '');
+    const sameDevice =
+      s.sessionId === params.sessionId ||
+      (cleanPhone.length >= 8 && memPhone === cleanPhone);
+    if (!sameDevice) continue;
+
+    if (s.status === 'connected' && isSocketTrulyOpen(s.socket)) {
+      return 'recovered';
+    }
+    if (s.status === 'connecting' && now - s.lastUpdated < 45000) {
+      return 'wait';
+    }
+  }
+
+  // 2. Check persisted DB sessions for this user (covers connected & valid standby devices)
+  const userDbSessions = getSessionsByUserId(owner!.id);
+  for (const s of userDbSessions) {
+    const dbPhone = normalizePhoneNumber(s.phone_number || '');
+    const sameDevice =
+      s.id === params.sessionId ||
+      (cleanPhone.length >= 8 && dbPhone === cleanPhone);
+    if (!sameDevice) continue;
+
+    const notExpiredByDate = !s.expires_at || Date.parse(s.expires_at) > now;
+    if (s.status === 'connected' && notExpiredByDate && hasRegisteredCredsOnDisk(s.id)) {
+      return 'recovered';
+    }
+  }
+
+  return 'expired';
+}
+
+function buildProfessionalExpiredSessionMessage(params: {
+  ownerName: string;
+  expiredPhone?: string;
+  sessionName?: string;
+}): string {
+  const wl = getWhitelabelConfig();
+  const appName = (wl?.app_name || 'Japriin').trim();
+  const publicUrl = resolvePublicAppBaseUrl();
+  const cleanPhone = normalizePhoneNumber(params.expiredPhone || '');
+  const deviceLabel = cleanPhone
+    ? `+${cleanPhone}`
+    : params.sessionName && !params.sessionName.startsWith('session_')
+      ? params.sessionName
+      : 'Perangkat WhatsApp Anda';
+  const urlBlock = publicUrl ? `\nTautan login: ${publicUrl}\n` : '\n';
+
+  return (
+    `Halo *${params.ownerName}*,\n\n` +
+    `Kami informasikan bahwa tautan perangkat WhatsApp Anda (*${deviceLabel}*) di *${appName}* saat ini sudah kedaluwarsa atau terputus selama lebih dari 1 jam.\n\n` +
+    `Silakan login ke akun *${appName}* Anda dan tautkan kembali perangkat pada menu *Koneksi WA* agar sesi dan layanan pengiriman pesan Anda kembali berjalan lancar.${urlBlock}\n` +
+    `Terima kasih.\n` +
+    `_Pesan pengingat ini hanya dikirim satu kali sampai perangkat Anda ditautkan kembali._`
+  );
 }
 
 export async function notifyUserSessionExpired(params: {
@@ -178,7 +266,8 @@ export async function notifyUserSessionExpired(params: {
   expiredPhone?: string;
   userId?: string;
   reason?: string;
-}): Promise<{ notified: boolean; skipped?: string; queued?: boolean }> {
+  graceMs?: number;
+}): Promise<{ notified: boolean; skipped?: string; queued?: boolean; scheduled?: boolean }> {
   const dbSess = getSessionById(params.sessionId);
   const resolvedPhone = normalizePhoneNumber(
     params.expiredPhone || dbSess?.phone_number || getCredsPhoneOnDisk(params.sessionId) || ''
@@ -206,51 +295,175 @@ export async function notifyUserSessionExpired(params: {
     return { notified: false, skipped: 'already_notified_until_relogin' };
   }
 
-  // Avoid queuing a self-notification loop if the only admin WA session itself is disconnected
-  if (owner!.role === 'admin' && !resolveConnectedSuperadminSession()) {
-    console.warn(
-      `[Baileys Expiry Alert] Sesi Superadmin ${params.sessionId} (+${resolvedPhone || '-'}) terputus/expired: ${params.reason || '-'}`
-    );
-    return { notified: false, skipped: 'admin_no_fallback_session' };
-  }
+  const alertKey = resolvedPhone ? `${owner!.id}:${resolvedPhone}` : `${owner!.id}:${params.sessionId}`;
+  const graceMs = typeof params.graceMs === 'number' && params.graceMs >= 0 ? params.graceMs : SESSION_EXPIRY_ALERT_GRACE_MS;
 
-  const wl = getWhitelabelConfig();
-  const appName = (wl?.app_name || 'Japriin').trim();
-  const publicUrl = resolvePublicAppBaseUrl();
-  const deviceLabel =
-    params.sessionName || dbSess?.session_name || (resolvedPhone ? `WA +${resolvedPhone}` : params.sessionId);
-  const numberDisplay = resolvedPhone ? `+${resolvedPhone}` : deviceLabel;
-  const reasonText = params.reason || 'sesi login WhatsApp sudah kedaluwarsa / terputus dari perangkat';
-  const urlLine = publicUrl ? `\n🔗 Login di: ${publicUrl}` : '';
+  const { item, created } = upsertPendingSessionExpiryAlert({
+    key: alertKey,
+    user_id: owner!.id,
+    session_id: params.sessionId,
+    session_name: params.sessionName || dbSess?.session_name,
+    expired_phone: resolvedPhone || undefined,
+    reason: params.reason,
+    grace_ms: graceMs
+  });
 
-  const message =
-    `⚠️ *Pemberitahuan Koneksi WhatsApp Terputus*\n\n` +
-    `Halo *${owner!.name || owner!.username}* 👋\n\n` +
-    `Sesi login WhatsApp *${numberDisplay}* (${deviceLabel}) di *${appName}* telah *terputus / logout* (${reasonText}).\n\n` +
-    `📲 Silakan *login kembali ke aplikasi* dan *sambungkan ulang perangkat WhatsApp* di menu *Koneksi WA* agar dapat kembali merespon chat customer.${urlLine}\n\n` +
-    `_Pemberitahuan ini hanya dikirim satu kali sampai Anda menyambungkan kembali perangkat tersebut._`;
-
-  for (const k of dedupeKeys) inFlightExpiryAlerts.add(k);
-  try {
-    const sendRes = await sendOrQueueViaSuperadminWa({
-      recipientPhone,
-      message,
-      category: 'session_expired',
-      ownerUserId: owner!.id,
-      invoiceNumber: `exp_${owner!.id}_${resolvedPhone || params.sessionId}`
-    });
-
-    if (sendRes.sent || sendRes.queued) {
-      markSessionExpiryAlertSent(dedupeKeys);
-    }
-
+  if (created) {
     console.log(
-      `[Baileys Expiry Alert] User=${owner!.username} (${recipientPhone}) Session=${params.sessionId} Sent=${sendRes.sent} Queued=${sendRes.queued}`
+      `[Baileys Expiry Alert Scheduled] User=${owner!.username} Session=${params.sessionId} (+${resolvedPhone || '-'}) ditunda 1 jam (kirim setelah ${item.notify_after}).`
     );
-    return { notified: sendRes.sent || sendRes.queued, queued: sendRes.queued };
-  } finally {
-    for (const k of dedupeKeys) inFlightExpiryAlerts.delete(k);
   }
+
+  return { notified: false, scheduled: true, queued: false };
+}
+
+let isProcessingPendingExpiryAlerts = false;
+export async function processPendingSessionExpiryAlerts(reason = 'watchdog'): Promise<{
+  checked: number;
+  sent: number;
+  cancelled: number;
+  waiting: number;
+}> {
+  if (isProcessingPendingExpiryAlerts) {
+    return { checked: 0, sent: 0, cancelled: 0, waiting: 0 };
+  }
+
+  const pending = getPendingSessionExpiryAlerts();
+  if (pending.length === 0) {
+    return { checked: 0, sent: 0, cancelled: 0, waiting: 0 };
+  }
+
+  isProcessingPendingExpiryAlerts = true;
+  let checked = 0;
+  let sent = 0;
+  let cancelled = 0;
+  let waiting = 0;
+
+  try {
+    const now = Date.now();
+    for (const alert of pending) {
+      checked++;
+
+      // Selalu cek ulang status sesi user (bahkan sebelum 1 jam) agar jika sudah pulih langsung dibatalkan
+      const preCheck = verifyExpiredAlertState({
+        userId: alert.user_id,
+        sessionId: alert.session_id,
+        expiredPhone: alert.expired_phone
+      });
+      if (preCheck === 'recovered') {
+        removePendingSessionExpiryAlert(alert.id);
+        cancelled++;
+        continue;
+      }
+
+      const notifyAfterMs = Date.parse(alert.notify_after || '');
+      if (Number.isFinite(notifyAfterMs) && now < notifyAfterMs) {
+        waiting++;
+        continue;
+      }
+
+      if (preCheck === 'wait') {
+        waiting++;
+        continue;
+      }
+
+      const owner = getUserById(alert.user_id);
+      if (!isOwnerActiveAndRegistered(owner)) {
+        removePendingSessionExpiryAlert(alert.id);
+        cancelled++;
+        continue;
+      }
+
+      const recipientPhone = normalizePhoneNumber(owner!.phone || '');
+      if (!recipientPhone || recipientPhone.length < 8) {
+        removePendingSessionExpiryAlert(alert.id);
+        cancelled++;
+        continue;
+      }
+
+      const cleanExpiredPhone = normalizePhoneNumber(alert.expired_phone || '');
+      const dedupeKeys = Array.from(
+        new Set(
+          [
+            cleanExpiredPhone ? `${owner!.id}:${cleanExpiredPhone}` : `${owner!.id}:${alert.session_id}`,
+            `${owner!.id}:${alert.session_id}`
+          ].filter(Boolean)
+        )
+      );
+
+      if (hasSessionExpiryAlertSent(dedupeKeys)) {
+        removePendingSessionExpiryAlert(alert.id);
+        cancelled++;
+        continue;
+      }
+
+      // Tunggu sampai WA Superadmin benar-benar terhubung
+      const saSession = resolveConnectedSuperadminSession();
+      if (!saSession) {
+        waiting++;
+        continue;
+      }
+
+      // Hindari self-notif jika satu-satunya admin WA yang terhubung justru nomor yg sama & tidak punya sesi lain
+      if (owner!.role === 'admin' && saSession.sessionId === alert.session_id) {
+        waiting++;
+        continue;
+      }
+
+      // Verifikasi ulang TERAKHIR tepat sebelum mengirim agar tidak salah kirim info ke user
+      const finalCheck = verifyExpiredAlertState({
+        userId: alert.user_id,
+        sessionId: alert.session_id,
+        expiredPhone: alert.expired_phone
+      });
+      if (finalCheck === 'recovered') {
+        removePendingSessionExpiryAlert(alert.id);
+        cancelled++;
+        continue;
+      }
+      if (finalCheck === 'wait') {
+        waiting++;
+        continue;
+      }
+
+      if (dedupeKeys.some(k => inFlightExpiryAlerts.has(k))) {
+        waiting++;
+        continue;
+      }
+
+      const message = buildProfessionalExpiredSessionMessage({
+        ownerName: owner!.name || owner!.username,
+        expiredPhone: alert.expired_phone,
+        sessionName: alert.session_name
+      });
+
+      for (const k of dedupeKeys) inFlightExpiryAlerts.add(k);
+      try {
+        await sendDirectlyViaSuperadminSocket(saSession, recipientPhone, message);
+        markSessionExpiryAlertSent(dedupeKeys);
+        removePendingSessionExpiryAlert(alert.id);
+        sent++;
+        console.log(
+          `[Baileys Expiry Alert Sent:${reason}] User=${owner!.username} (${recipientPhone}) ExpiredPhone=+${cleanExpiredPhone || '-'} Session=${alert.session_id}`
+        );
+        if (pending.length > 1) {
+          await delay(3500 + crypto.randomInt(0, 1500));
+        }
+      } catch (err: any) {
+        waiting++;
+        console.warn(
+          `[Baileys Expiry Alert Retry] Gagal kirim notifikasi expired ke ${recipientPhone}, ditahan untuk percobaan berikutnya:`,
+          err?.message || err
+        );
+      } finally {
+        for (const k of dedupeKeys) inFlightExpiryAlerts.delete(k);
+      }
+    }
+  } finally {
+    isProcessingPendingExpiryAlerts = false;
+  }
+
+  return { checked, sent, cancelled, waiting };
 }
 
 export function buildBaileysSocketConfig(version: [number, number, number], logger: any, authState: any) {
@@ -1875,6 +2088,7 @@ export async function getOrStartBaileysSession(
           if (owner!.role === 'admin') {
             setTimeout(() => {
               drainSuperadminWaQueue('admin_session_open').catch(() => {});
+              processPendingSessionExpiryAlerts('admin_session_open').catch(() => {});
             }, 2500);
           }
         } else if (connection === 'close') {
@@ -2156,6 +2370,7 @@ export async function requestBaileysPairingCode(
         if (owner!.role === 'admin') {
           setTimeout(() => {
             drainSuperadminWaQueue('admin_pairing_open').catch(() => {});
+            processPendingSessionExpiryAlerts('admin_pairing_open').catch(() => {});
           }, 2500);
         }
       } else if (connection === 'close') {
@@ -3054,6 +3269,14 @@ export async function runBaileysPeriodicHealthCheck(): Promise<{
     drainSuperadminWaQueue('watchdog').catch(() => {});
   }
 
+  const pendingRes = await processPendingSessionExpiryAlerts('watchdog').catch(() => ({
+    checked: 0,
+    sent: 0,
+    cancelled: 0,
+    waiting: 0
+  }));
+  notified += pendingRes.sent;
+
   return { checked, healed, notified };
 }
 
@@ -3681,6 +3904,24 @@ export async function drainSuperadminWaQueue(
 
       processed++;
       try {
+        if (item.category === 'session_expired' && item.owner_user_id) {
+          const sidFromInvoice = item.invoice_number?.startsWith(`exp_${item.owner_user_id}_`)
+            ? item.invoice_number.slice(`exp_${item.owner_user_id}_`.length)
+            : '';
+          const stateCheck = verifyExpiredAlertState({
+            userId: item.owner_user_id,
+            sessionId: sidFromInvoice,
+            expiredPhone: sidFromInvoice
+          });
+          if (stateCheck === 'recovered') {
+            removeSuperadminWaQueueItem(item.id);
+            continue;
+          }
+          if (stateCheck === 'wait') {
+            continue;
+          }
+        }
+
         await sendDirectlyViaSuperadminSocket(liveSa, item.recipient_phone, item.message);
         removeSuperadminWaQueueItem(item.id);
         sent++;

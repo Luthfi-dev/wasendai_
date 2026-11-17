@@ -109,7 +109,8 @@ import {
   shutdownBaileysManager,
   getLiveSessionRuntimeStatus,
   reconnectBaileysSessionForUser,
-  ensureConnectedSessionForUser
+  ensureConnectedSessionForUser,
+  clearSessionExpiryNotificationCooldown
 } from './src/lib/baileysManager.js';
 import { resolveIncomingApiMedia, ResolvedApiMedia } from './src/lib/mediaSecurity.js';
 import {
@@ -3603,6 +3604,7 @@ const handleRenewSession: express.RequestHandler = (req, res) => {
   const days = Math.min(90, Math.max(1, Number(req.body?.days) || 30));
   const updated = extendWhatsAppSession(req.params.id, days);
   if (updated) {
+    clearSessionExpiryNotificationCooldown(updated.id, updated.user_id, updated.phone_number);
     res.json({ success: true, message: `Masa aktif sesi WhatsApp berhasil diperpanjang +${days} hari!`, data: updated });
   } else {
     res.status(404).json({ success: false, error: 'Sesi tidak ditemukan.' });

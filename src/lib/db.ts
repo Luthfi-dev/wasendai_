@@ -19,6 +19,7 @@ import {
   CatalogSettings,
   CatalogPaymentAccount,
   SuperadminWaQueueItem,
+  PendingSessionExpiryAlert,
   AutoReplyStatusInfo
 } from '../types/whatsapp.js';
 import {
@@ -79,6 +80,9 @@ function loadEncryptedLocalDb(): LocalDatabase | null {
         parsed.expiredSessionAlertKeys && typeof parsed.expiredSessionAlertKeys === 'object'
           ? parsed.expiredSessionAlertKeys
           : {},
+      pendingSessionExpiryAlerts: Array.isArray(parsed.pendingSessionExpiryAlerts)
+        ? parsed.pendingSessionExpiryAlerts
+        : [],
       stats: parsed.stats || {
         total_incoming: 0,
         total_auto_replied: 0,
@@ -373,6 +377,21 @@ export function replaceRuntimeDatabaseFromMysql(remote: any): void {
     if (remote.kvMap.expiredSessionAlertKeys && typeof remote.kvMap.expiredSessionAlertKeys === 'object') {
       db.expiredSessionAlertKeys = { ...remote.kvMap.expiredSessionAlertKeys };
     }
+    if (Array.isArray(remote.kvMap.pendingSessionExpiryAlerts)) {
+      const mergedPending = new Map<string, PendingSessionExpiryAlert>();
+      for (const item of remote.kvMap.pendingSessionExpiryAlerts) {
+        if (item?.key) mergedPending.set(item.key, item);
+      }
+      for (const item of db.pendingSessionExpiryAlerts || []) {
+        if (item?.key) {
+          const prev = mergedPending.get(item.key);
+          if (!prev || Date.parse(item.first_detected_at) <= Date.parse(prev.first_detected_at)) {
+            mergedPending.set(item.key, item);
+          }
+        }
+      }
+      db.pendingSessionExpiryAlerts = Array.from(mergedPending.values()).slice(-500);
+    }
     if (remote.kvMap.stats) {
       db.stats = { ...db.stats, ...remote.kvMap.stats };
     }
@@ -443,6 +462,7 @@ export interface LocalDatabase {
   catalogSettings?: Record<string, CatalogSettings>;
   superadminWaQueue?: SuperadminWaQueueItem[];
   expiredSessionAlertKeys?: Record<string, string>;
+  pendingSessionExpiryAlerts?: PendingSessionExpiryAlert[];
   stats: {
     total_incoming: number;
     total_auto_replied: number;
@@ -705,6 +725,7 @@ export function initDbFile(): LocalDatabase {
     catalogSettings: {},
     superadminWaQueue: [],
     expiredSessionAlertKeys: {},
+    pendingSessionExpiryAlerts: [],
     stats: {
       total_incoming: 0,
       total_auto_replied: 0,
@@ -4019,3 +4040,108 @@ export function clearSessionExpiryAlertSent(keys: string[]): void {
     asyncSyncKv('expiredSessionAlertKeys', db.expiredSessionAlertKeys);
   }
 }
+
+export function getPendingSessionExpiryAlerts(): PendingSessionExpiryAlert[] {
+  const db = initDbFile();
+  if (!Array.isArray(db.pendingSessionExpiryAlerts)) db.pendingSessionExpiryAlerts = [];
+  return [...db.pendingSessionExpiryAlerts];
+}
+
+export function upsertPendingSessionExpiryAlert(params: {
+  key: string;
+  user_id: string;
+  session_id: string;
+  session_name?: string;
+  expired_phone?: string;
+  reason?: string;
+  grace_ms: number;
+}): { item: PendingSessionExpiryAlert; created: boolean } {
+  const db = initDbFile();
+  if (!Array.isArray(db.pendingSessionExpiryAlerts)) {
+    db.pendingSessionExpiryAlerts = [];
+  }
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const cleanKey = String(params.key || '').trim();
+  const existingIdx = db.pendingSessionExpiryAlerts.findIndex(a => a.key === cleanKey);
+
+  if (existingIdx !== -1) {
+    const prev = db.pendingSessionExpiryAlerts[existingIdx];
+    const updated: PendingSessionExpiryAlert = {
+      ...prev,
+      session_id: params.session_id || prev.session_id,
+      session_name: params.session_name || prev.session_name,
+      expired_phone: params.expired_phone || prev.expired_phone,
+      reason: params.reason || prev.reason,
+      updated_at: nowIso
+    };
+    db.pendingSessionExpiryAlerts[existingIdx] = updated;
+    writeDbFile(db, true);
+    asyncSyncKv('pendingSessionExpiryAlerts', db.pendingSessionExpiryAlerts);
+    return { item: updated, created: false };
+  }
+
+  const created: PendingSessionExpiryAlert = {
+    id: `psea_${nowMs}_${crypto.randomBytes(4).toString('hex')}`,
+    key: cleanKey,
+    user_id: params.user_id,
+    session_id: params.session_id,
+    session_name: params.session_name,
+    expired_phone: params.expired_phone,
+    first_detected_at: nowIso,
+    notify_after: new Date(nowMs + Math.max(0, params.grace_ms)).toISOString(),
+    reason: params.reason,
+    updated_at: nowIso
+  };
+
+  db.pendingSessionExpiryAlerts.push(created);
+  if (db.pendingSessionExpiryAlerts.length > 500) {
+    db.pendingSessionExpiryAlerts = db.pendingSessionExpiryAlerts.slice(-500);
+  }
+  writeDbFile(db, true);
+  asyncSyncKv('pendingSessionExpiryAlerts', db.pendingSessionExpiryAlerts);
+  return { item: created, created: true };
+}
+
+export function removePendingSessionExpiryAlert(idOrKey: string): boolean {
+  const db = initDbFile();
+  if (!Array.isArray(db.pendingSessionExpiryAlerts) || !idOrKey) return false;
+  const before = db.pendingSessionExpiryAlerts.length;
+  db.pendingSessionExpiryAlerts = db.pendingSessionExpiryAlerts.filter(
+    a => a.id !== idOrKey && a.key !== idOrKey
+  );
+  if (db.pendingSessionExpiryAlerts.length !== before) {
+    writeDbFile(db, true);
+    asyncSyncKv('pendingSessionExpiryAlerts', db.pendingSessionExpiryAlerts);
+    return true;
+  }
+  return false;
+}
+
+export function clearPendingSessionExpiryAlertsByKeys(params: {
+  userId?: string;
+  sessionId?: string;
+  phone?: string;
+}): number {
+  const db = initDbFile();
+  if (!Array.isArray(db.pendingSessionExpiryAlerts) || db.pendingSessionExpiryAlerts.length === 0) {
+    return 0;
+  }
+  const cleanPhone = params.phone ? normalizePhoneForUniqueness(params.phone) : '';
+  const before = db.pendingSessionExpiryAlerts.length;
+  db.pendingSessionExpiryAlerts = db.pendingSessionExpiryAlerts.filter(a => {
+    if (params.userId && a.user_id !== params.userId) return true;
+    const matchSid = Boolean(params.sessionId && a.session_id === params.sessionId);
+    const matchPhone = Boolean(
+      cleanPhone && a.expired_phone && normalizePhoneForUniqueness(a.expired_phone) === cleanPhone
+    );
+    return !(matchSid || matchPhone);
+  });
+  const removed = before - db.pendingSessionExpiryAlerts.length;
+  if (removed > 0) {
+    writeDbFile(db, true);
+    asyncSyncKv('pendingSessionExpiryAlerts', db.pendingSessionExpiryAlerts);
+  }
+  return removed;
+}
+
