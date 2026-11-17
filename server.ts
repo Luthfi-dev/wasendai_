@@ -3569,7 +3569,7 @@ app.post('/api/sessions/:id/reconnect', requireAuth, async (req, res) => {
       message: result.connected
         ? `Perangkat +${result.phone_number || ''} berhasil tersambung kembali!`
         : result.needs_rescan
-          ? 'Kredensial sesi tidak ditemukan atau sudah terputus dari HP. Silakan Login Ulang dengan Kode Pairing atau Scan QR.'
+          ? `Kredensial sesi tidak ditemukan atau sudah terputus dari HP${result.disconnect_reason ? ` (${result.disconnect_reason})` : ''}. Silakan Login Ulang dengan Kode Pairing atau Scan QR.`
           : 'Sedang mencoba menyambungkan ulang ke WhatsApp...'
     });
   } catch (err: any) {

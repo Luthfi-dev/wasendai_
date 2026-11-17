@@ -166,15 +166,55 @@ const lastAuthBackupAt = new Map<string, number>();
 const lastAuthBackupHashes = new Map<string, string>();
 const reconnectTimers = new Map<string, NodeJS.Timeout>();
 const inFlightExpiryAlerts = new Set<string>();
+const recentMessageProtoCache = new Map<string, any>();
+const sessionDisconnectDiagnostics = new Map<string, { code?: number; reason: string; at: number }>();
 const AUTH_DIR = path.resolve(process.cwd(), 'baileys_auth_sessions');
 const UNSCANNED_HANDSHAKE_TTL_MS = 3 * 60 * 1000;
 const FREE_IDLE_SOCKET_TTL_MS = 3 * 60 * 1000;
 const MAX_RECONNECT_RETRIES = 10;
-const AUTH_BACKUP_DEBOUNCE_MS = 30000;
-const AUTH_BACKUP_COOLDOWN_MS = 120000;
+const AUTH_BACKUP_DEBOUNCE_MS = 4000;
+const AUTH_BACKUP_COOLDOWN_MS = 15000;
 const PRUNE_COOLDOWN_MS = 120000;
 const MYSQL_AUTH_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
 const SESSION_EXPIRY_ALERT_GRACE_MS = 60 * 60 * 1000; // Tunggu 1 jam sebelum kirim WA pengingat kedaluwarsa
+
+function rememberProtoMessage(key: { remoteJid?: string | null; id?: string | null }, message: any) {
+  const id = key?.id ? String(key.id) : '';
+  if (!id || !message) return;
+  const cacheKey = `${key?.remoteJid || ''}:${id}`;
+  if (recentMessageProtoCache.has(cacheKey)) {
+    recentMessageProtoCache.delete(cacheKey);
+  }
+  recentMessageProtoCache.set(cacheKey, message);
+  if (recentMessageProtoCache.size > 250) {
+    const oldest = recentMessageProtoCache.keys().next().value;
+    if (oldest) recentMessageProtoCache.delete(oldest);
+  }
+}
+
+function recordDisconnectDiagnostic(sessionId: string, statusCode?: number, errMessage?: string) {
+  let reason = `status_${statusCode ?? 'unknown'}`;
+  if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+    reason = '401_logged_out_dari_hp_atau_server_wa';
+  } else if (statusCode === DisconnectReason.connectionReplaced || statusCode === 440) {
+    reason = '440_konflik_koneksi_ganda';
+  } else if (statusCode === DisconnectReason.badSession || statusCode === 500) {
+    reason = '500_bad_session_key_desync';
+  } else if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+    reason = '515_restart_required';
+  } else if (statusCode === DisconnectReason.timedOut || statusCode === 408) {
+    reason = '408_websocket_timeout';
+  } else if (statusCode === DisconnectReason.connectionClosed || statusCode === 428) {
+    reason = '428_connection_closed';
+  } else if (errMessage) {
+    reason = `${statusCode ?? 'err'}: ${errMessage.slice(0, 100)}`;
+  }
+  sessionDisconnectDiagnostics.set(sessionId, {
+    code: statusCode,
+    reason,
+    at: Date.now()
+  });
+}
 
 export function clearSessionExpiryNotificationCooldown(sessionId: string, ownerUserId?: string, phone?: string) {
   const cleanPhone = normalizePhoneNumber(phone || '');
@@ -504,6 +544,13 @@ export function buildBaileysSocketConfig(version: [number, number, number], logg
     qrTimeout: 60000,
     retryRequestDelayMs: 2500,
     maxMsgRetryCount: 2,
+    getMessage: async (key: { remoteJid?: string | null; id?: string | null }) => {
+      if (!key?.id) return undefined;
+      return (
+        recentMessageProtoCache.get(`${key.remoteJid || ''}:${key.id}`) ||
+        undefined
+      );
+    },
     transactionOpts: {
       maxCommitRetries: 5,
       delayBetweenTriesMs: 1000
@@ -873,6 +920,39 @@ function isOwnerActiveAndRegistered(owner: ReturnType<typeof getUserById>): bool
   return Boolean(owner && owner.is_active && owner.email_verified);
 }
 
+async function flushAuthFolderBackupNow(sessionId: string): Promise<void> {
+  if (!sessionId || !isMysqlConfigured()) return;
+  const folder = safeSessionFolderPath(sessionId);
+  if (!folder) return;
+  try {
+    if (!hasRegisteredCredsOnDisk(sessionId)) return;
+    const dirEntries = await fs.promises.readdir(folder, { withFileTypes: true }).catch(() => null);
+    if (!dirEntries) return;
+    const files = dirEntries
+      .filter(d => d.isFile() && d.name.endsWith('.json'))
+      .map(d => d.name)
+      .sort();
+    const filesMap: Record<string, string> = {};
+    const hash = crypto.createHash('sha256');
+    for (const file of files) {
+      const fp = path.join(folder, file);
+      const content = await fs.promises.readFile(fp, 'utf-8');
+      filesMap[file] = content;
+      hash.update(file).update('\0').update(content).update('\0');
+    }
+    if (!filesMap['creds.json']) return;
+    const digest = hash.digest('hex');
+    if (lastAuthBackupHashes.get(sessionId) === digest) {
+      return;
+    }
+    await saveBaileysAuthToMysql(sessionId, filesMap);
+    lastAuthBackupHashes.set(sessionId, digest);
+    lastAuthBackupAt.set(sessionId, Date.now());
+  } catch {
+    // Non-blocking backup
+  }
+}
+
 function scheduleAuthFolderBackup(sessionId: string, immediate = false) {
   if (!sessionId || !isMysqlConfigured()) return;
   const folder = safeSessionFolderPath(sessionId);
@@ -881,41 +961,17 @@ function scheduleAuthFolderBackup(sessionId: string, immediate = false) {
   const prev = authBackupTimers.get(sessionId);
   if (prev) clearTimeout(prev);
 
-  const lastAt = lastAuthBackupAt.get(sessionId) || 0;
-  const waitMs = immediate
-    ? 2000
-    : Math.max(AUTH_BACKUP_DEBOUNCE_MS, lastAt + AUTH_BACKUP_COOLDOWN_MS - Date.now());
+  if (immediate) {
+    void flushAuthFolderBackupNow(sessionId);
+    return;
+  }
 
-  const timer = setTimeout(async () => {
+  const lastAt = lastAuthBackupAt.get(sessionId) || 0;
+  const waitMs = Math.max(AUTH_BACKUP_DEBOUNCE_MS, lastAt + AUTH_BACKUP_COOLDOWN_MS - Date.now());
+
+  const timer = setTimeout(() => {
     authBackupTimers.delete(sessionId);
-    if (!isMysqlConfigured()) return;
-    try {
-      if (!hasRegisteredCredsOnDisk(sessionId)) return;
-      const dirEntries = await fs.promises.readdir(folder, { withFileTypes: true }).catch(() => null);
-      if (!dirEntries) return;
-      const files = dirEntries
-        .filter(d => d.isFile() && d.name.endsWith('.json'))
-        .map(d => d.name)
-        .sort();
-      const filesMap: Record<string, string> = {};
-      const hash = crypto.createHash('sha256');
-      for (const file of files) {
-        const fp = path.join(folder, file);
-        const content = await fs.promises.readFile(fp, 'utf-8');
-        filesMap[file] = content;
-        hash.update(file).update('\0').update(content).update('\0');
-      }
-      if (!filesMap['creds.json']) return;
-      const digest = hash.digest('hex');
-      if (lastAuthBackupHashes.get(sessionId) === digest) {
-        return;
-      }
-      await saveBaileysAuthToMysql(sessionId, filesMap);
-      lastAuthBackupHashes.set(sessionId, digest);
-      lastAuthBackupAt.set(sessionId, Date.now());
-    } catch {
-      // Non-blocking backup
-    }
+    void flushAuthFolderBackupNow(sessionId);
   }, waitMs);
   timer.unref?.();
 
@@ -1147,6 +1203,9 @@ function attachSocketMessageListener(sock: any, sessionId: string, sessionData: 
       if (m.type !== 'notify' && m.type !== 'append') return;
       for (const msg of m.messages) {
         if (!msg.message) continue;
+        if (msg.key?.id) {
+          rememberProtoMessage(msg.key, msg.message);
+        }
 
         const remoteJid = msg.key?.remoteJid || msg.message?.deviceSentMessage?.destinationJid;
         if (!remoteJid) continue;
@@ -2136,9 +2195,10 @@ export async function getOrStartBaileysSession(
           sessionData.userId = owner!.id;
           sessionData.is_primary = Boolean(getSessionById(sessionId)?.is_primary);
           clearSessionExpiryNotificationCooldown(sessionId, owner!.id, connectedUser);
+          sessionDisconnectDiagnostics.delete(sessionId);
           cleanupDuplicateSessionsForOwnerPhone(sessionId, owner!.id, connectedUser);
           activeSessions.set(sessionId, sessionData);
-          scheduleAuthFolderBackup(sessionId, true);
+          await flushAuthFolderBackupNow(sessionId).catch(() => {});
 
           const isPairingMethod = Boolean(phoneNumber) || sessionId.includes('_pair_');
           const existingDb =
@@ -2191,6 +2251,8 @@ export async function getOrStartBaileysSession(
           }
         } else if (connection === 'close') {
           const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+          const disconnectErrMsg = (lastDisconnect?.error as any)?.message ? String((lastDisconnect?.error as any).message) : '';
+          recordDisconnectDiagnostic(sessionId, statusCode, disconnectErrMsg);
           const isPermanentLogout = isPermanentLogoutCode(statusCode);
           const isProtocolGlitch = isRecoverableProtocolCode(statusCode);
           const hasInMemRegistered = Boolean(sock.authState?.creds?.registered || sock.user?.id);
@@ -2213,7 +2275,7 @@ export async function getOrStartBaileysSession(
           }
 
           console.log(
-            `[Baileys] Connection closed for ${sessionId}. Status: ${statusCode}. Registered: ${isRegistered}. PermanentLogout: ${isPermanentLogout}`
+            `[Baileys] Connection closed for ${sessionId}. Status: ${statusCode}. Registered: ${isRegistered}. PermanentLogout: ${isPermanentLogout}${disconnectErrMsg ? `. Reason: ${disconnectErrMsg}` : ''}`
           );
 
           try {
@@ -2465,9 +2527,10 @@ export async function requestBaileysPairingCode(
       sessionData.disconnectedSince = undefined;
       sessionData.userId = owner!.id;
       clearSessionExpiryNotificationCooldown(sessionId, owner!.id, connectedUser);
+      sessionDisconnectDiagnostics.delete(sessionId);
       cleanupDuplicateSessionsForOwnerPhone(sessionId, owner!.id, connectedUser);
       activeSessions.set(sessionId, sessionData);
-      scheduleAuthFolderBackup(sessionId, true);
+      await flushAuthFolderBackupNow(sessionId).catch(() => {});
 
       const db = initDbFile();
       const existingDb =
@@ -2520,6 +2583,8 @@ export async function requestBaileysPairingCode(
         }
       } else if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+      const disconnectErrMsg = (lastDisconnect?.error as any)?.message ? String((lastDisconnect?.error as any).message) : '';
+      recordDisconnectDiagnostic(sessionId, statusCode, disconnectErrMsg);
       const isPermanentLogout = isPermanentLogoutCode(statusCode);
       const isProtocolGlitch = isRecoverableProtocolCode(statusCode);
       const hasInMemRegistered = Boolean(sock.authState?.creds?.registered || sock.user?.id);
@@ -2535,7 +2600,7 @@ export async function requestBaileysPairingCode(
         hasInMemRegistered ||
         Boolean(existingMeta?.connected_at);
 
-      console.log(`[Baileys Pairing] Connection closed ${sessionId}, code: ${statusCode}, registered: ${isRegistered}`);
+      console.log(`[Baileys Pairing] Connection closed ${sessionId}, code: ${statusCode}, registered: ${isRegistered}${disconnectErrMsg ? `, reason: ${disconnectErrMsg}` : ''}`);
 
       const latestSession = activeSessions.get(sessionId);
       if (latestSession && latestSession.socket && latestSession.socket !== sock) {
@@ -2718,6 +2783,8 @@ export async function reconnectBaileysSessionForUser(
   needs_rescan: boolean;
   session_id: string;
   phone_number?: string;
+  disconnect_code?: number;
+  disconnect_reason?: string;
 }> {
   const sessionId = sanitizeSessionId(rawSessionId);
   const dbSess = getSessionById(sessionId);
@@ -2746,12 +2813,15 @@ export async function reconnectBaileysSessionForUser(
   }
 
   if (!hasCreds) {
+    const diag = sessionDisconnectDiagnostics.get(effectiveId) || sessionDisconnectDiagnostics.get(sessionId);
     return {
       connected: false,
       runtime_status: 'disconnected',
       needs_rescan: true,
       session_id: effectiveId,
-      phone_number: dbSess?.phone_number
+      phone_number: dbSess?.phone_number,
+      disconnect_code: diag?.code,
+      disconnect_reason: diag?.reason
     };
   }
 

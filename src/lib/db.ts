@@ -37,6 +37,18 @@ import {
 const RUNTIME_DB_PATH = path.resolve(process.cwd(), '.runtime_db.enc');
 let cachedMemoryDb: LocalDatabase | null = null;
 let lastLocalMutationAt = 0;
+let lastLoadedDbMtimeMs = 0;
+let lastDiskStatCheckedAt = 0;
+
+function syncDbFileMtimeMarker(): void {
+  try {
+    const st = fs.statSync(RUNTIME_DB_PATH);
+    lastLoadedDbMtimeMs = st.mtimeMs;
+    lastDiskStatCheckedAt = Date.now();
+  } catch {
+    // Ignore stat errors
+  }
+}
 
 function loadEncryptedLocalDb(): LocalDatabase | null {
   if (process.env.JAPRIIN_EPHEMERAL_DB === '1') return null;
@@ -107,6 +119,7 @@ function saveEncryptedLocalDb(data: LocalDatabase): void {
     const tmpPath = `${RUNTIME_DB_PATH}.${process.pid}.tmp`;
     fs.writeFileSync(tmpPath, encrypted, { mode: 0o600 });
     fs.renameSync(tmpPath, RUNTIME_DB_PATH);
+    syncDbFileMtimeMarker();
   } catch (err: any) {
     console.warn('[Local DB Save] Failed to persist .runtime_db.enc:', err?.message);
   }
@@ -124,6 +137,7 @@ async function saveEncryptedLocalDbAsync(data: LocalDatabase): Promise<void> {
     const tmpPath = `${RUNTIME_DB_PATH}.${process.pid}.tmp`;
     await fs.promises.writeFile(tmpPath, encrypted, { mode: 0o600 });
     await fs.promises.rename(tmpPath, RUNTIME_DB_PATH);
+    syncDbFileMtimeMarker();
   } catch (err: any) {
     console.warn('[Local DB Save] Failed to persist .runtime_db.enc:', err?.message);
   } finally {
@@ -698,7 +712,25 @@ const challengeCleanupTimer = setInterval(() => {
 challengeCleanupTimer.unref?.();
 
 export function initDbFile(): LocalDatabase {
+  const now = Date.now();
   if (cachedMemoryDb) {
+    if (now - lastDiskStatCheckedAt > 1000 && process.env.JAPRIIN_EPHEMERAL_DB !== '1') {
+      lastDiskStatCheckedAt = now;
+      try {
+        if (fs.existsSync(RUNTIME_DB_PATH)) {
+          const diskMtime = fs.statSync(RUNTIME_DB_PATH).mtimeMs;
+          if (diskMtime > lastLoadedDbMtimeMs + 1) {
+            const reloaded = loadEncryptedLocalDb();
+            if (reloaded) {
+              cachedMemoryDb = reloaded;
+              lastLoadedDbMtimeMs = diskMtime;
+            }
+          }
+        }
+      } catch {
+        // Ignore stat race
+      }
+    }
     return cachedMemoryDb;
   }
 
@@ -711,6 +743,7 @@ export function initDbFile(): LocalDatabase {
       }
     }
     cachedMemoryDb = persisted;
+    syncDbFileMtimeMarker();
     return persisted;
   }
 
