@@ -2147,15 +2147,16 @@ app.put('/api/gemini/keys/:id/toggle', requireMasterUnlocked, handleDeprecatedGe
 app.post('/api/gemini-keys/:id/toggle', requireMasterUnlocked, handleDeprecatedGeminiKeyMutation);
 app.put('/api/gemini-keys/:id/toggle', requireMasterUnlocked, handleDeprecatedGeminiKeyMutation);
 
-app.get('/api/ai/status', requireAuth, async (req, res) => {
+app.get('/api/ai/status', requireAuth, (req, res) => {
   const authUser = (req as any).authUser as UserAccount;
   const sysConfig = getSystemConfig();
-  let availability = getMetaAiAvailabilityForUser(authUser.id);
+  const availability = getMetaAiAvailabilityForUser(authUser.id);
   const userDbSessions = getSessionsByUserId(authUser.id).filter(s => s.status !== 'disconnected');
+  const arStatus = getUserAutoReplyStatus(authUser, sysConfig);
 
-  if (!availability.connected && userDbSessions.length > 0) {
-    await ensureConnectedMetaAiSocketForUser(authUser.id).catch(() => null);
-    availability = getMetaAiAvailabilityForUser(authUser.id);
+  // Jangan memblokir HTTP response dengan await socket handshake; bangunkan di latar belakang hanya jika respon otomatis aktif
+  if (!availability.connected && userDbSessions.length > 0 && (authUser.role === 'admin' || !arStatus.is_free_plan || arStatus.allowed)) {
+    void ensureConnectedMetaAiSocketForUser(authUser.id).catch(() => null);
   }
 
   const primaryLinked = userDbSessions.find(s => s.is_primary) || userDbSessions[0] || null;
@@ -2184,7 +2185,7 @@ app.get('/api/ai/status', requireAuth, async (req, res) => {
     last_error: availability.lastError || null,
     ai_enabled: authUser.role === 'admin' ? Boolean(sysConfig.ai_config?.enabled) : (authUser.ai_enabled === true),
     fallback_when_no_rule: Boolean(sysConfig.ai_config?.fallback_when_no_rule),
-    auto_reply_status: getUserAutoReplyStatus(authUser, sysConfig),
+    auto_reply_status: arStatus,
     connected_sessions: authUser.role === 'admin' ? getAllConnectedMetaAiSessions() : undefined
   });
 });

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { apiFetch } from './lib/csrfFetch';
 import { DEFAULT_PUBLIC_LOGO_URL, resolveLogoUrl } from './lib/branding';
 import {
@@ -48,21 +48,61 @@ import {
 import { Header } from './components/Header';
 import { StatsCards } from './components/StatsCards';
 import { MessageLogsTable } from './components/MessageLogsTable';
-import { AutoReplyRules } from './components/AutoReplyRules';
-import { AntiBanPanel } from './components/AntiBanPanel';
-import { UserManagementPanel } from './components/UserManagementPanel';
-import { ConfigPanel } from './components/ConfigPanel';
-import { SqlSchemaViewer } from './components/SqlSchemaViewer';
-import { WhatsAppConnectPanel } from './components/WhatsAppConnectPanel';
-import { LandingPage } from './components/LandingPage';
-import { AuthModal } from './components/AuthModal';
-import { PaymentUpgradeModal } from './components/PaymentUpgradeModal';
-import { ApiDocsPanel } from './components/ApiDocsPanel';
-import { SuperadminMasterPanel } from './components/SuperadminMasterPanel';
-import { SecurityPinModal } from './components/SecurityPinModal';
-import { BroadcastPanel } from './components/BroadcastPanel';
-import { ProfilePanel } from './components/ProfilePanel';
-import { CatalogShopPanel } from './components/CatalogShopPanel';
+
+const AutoReplyRules = lazy(() =>
+  import('./components/AutoReplyRules').then(m => ({ default: m.AutoReplyRules }))
+);
+const AntiBanPanel = lazy(() =>
+  import('./components/AntiBanPanel').then(m => ({ default: m.AntiBanPanel }))
+);
+const UserManagementPanel = lazy(() =>
+  import('./components/UserManagementPanel').then(m => ({ default: m.UserManagementPanel }))
+);
+const ConfigPanel = lazy(() =>
+  import('./components/ConfigPanel').then(m => ({ default: m.ConfigPanel }))
+);
+const SqlSchemaViewer = lazy(() =>
+  import('./components/SqlSchemaViewer').then(m => ({ default: m.SqlSchemaViewer }))
+);
+const WhatsAppConnectPanel = lazy(() =>
+  import('./components/WhatsAppConnectPanel').then(m => ({ default: m.WhatsAppConnectPanel }))
+);
+const LandingPage = lazy(() =>
+  import('./components/LandingPage').then(m => ({ default: m.LandingPage }))
+);
+const AuthModal = lazy(() =>
+  import('./components/AuthModal').then(m => ({ default: m.AuthModal }))
+);
+const PaymentUpgradeModal = lazy(() =>
+  import('./components/PaymentUpgradeModal').then(m => ({ default: m.PaymentUpgradeModal }))
+);
+const ApiDocsPanel = lazy(() =>
+  import('./components/ApiDocsPanel').then(m => ({ default: m.ApiDocsPanel }))
+);
+const SuperadminMasterPanel = lazy(() =>
+  import('./components/SuperadminMasterPanel').then(m => ({ default: m.SuperadminMasterPanel }))
+);
+const SecurityPinModal = lazy(() =>
+  import('./components/SecurityPinModal').then(m => ({ default: m.SecurityPinModal }))
+);
+const BroadcastPanel = lazy(() =>
+  import('./components/BroadcastPanel').then(m => ({ default: m.BroadcastPanel }))
+);
+const ProfilePanel = lazy(() =>
+  import('./components/ProfilePanel').then(m => ({ default: m.ProfilePanel }))
+);
+const CatalogShopPanel = lazy(() =>
+  import('./components/CatalogShopPanel').then(m => ({ default: m.CatalogShopPanel }))
+);
+
+function ChunkLoaderFallback({ label = 'Memuat modul...' }: { label?: string }) {
+  return (
+    <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-8 flex flex-col items-center justify-center gap-3 text-center shadow-sm">
+      <div className="w-7 h-7 rounded-full border-2 border-emerald-500/30 border-t-emerald-600 animate-spin" />
+      <p className="text-xs font-semibold text-slate-500 dark:text-slate-400">{label}</p>
+    </div>
+  );
+}
 
 function normalizeUserClient(u: any, prev?: UserAccount | null): UserAccount {
   const emailVerified = Boolean(u?.email_verified === true || u?.email_verified === 1 || u?.email_verified === '1' || u?.email_verified === 'true');
@@ -422,8 +462,15 @@ export function App() {
           }
         });
 
-      // Poll whitelabel & session status every 3rd tick (60s) to cut server load
+      // Poll whitelabel, sessions & auth status every 3rd tick (60s) to cut server load
       if (pollTick % 3 === 0) {
+        safeFetchJson(`/api/sessions?userId=${encodeURIComponent(uId)}`, { success: false })
+          .then(res => {
+            if (pollEpoch === authEpochRef.current && res.success && Array.isArray(res.data)) {
+              setSessions(prev => (JSON.stringify(prev) === JSON.stringify(res.data) ? prev : res.data));
+            }
+          });
+
         safeFetchJson('/api/whitelabel', { success: false })
           .then(res => {
             if (pollEpoch === authEpochRef.current && res.success && res.data) {
@@ -651,38 +698,57 @@ export function App() {
   if (viewMode === 'landing') {
     return (
       <div className="min-h-screen max-w-full overflow-x-hidden bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 transition-colors duration-200">
-        <LandingPage
-          plans={plans}
-          freeAutoReplyHours={freeAutoReplyHours}
-          onLoginSuccess={handleLoginSuccess}
-          onOpenAuthModal={handleOpenAuthModal}
-          onSelectPaidPlan={handleSelectPaidPlan}
-          isDarkMode={isDarkMode}
-          onToggleTheme={handleToggleTheme}
-          whitelabel={whitelabel}
-        />
-        <AuthModal
-          isOpen={isAuthOpen}
-          mode={authMode}
-          defaultPlanId={selectedPlanId}
-          plans={plans}
-          onClose={() => setIsAuthOpen(false)}
-          onLoginSuccess={handleLoginSuccess}
-          onSwitchMode={(m) => setAuthMode(m)}
-          whitelabel={whitelabel}
-        />
-        <PaymentUpgradeModal
-          isOpen={isUpgradeOpen}
-          selectedPlan={targetPaidPlan}
-          plan={targetPaidPlan}
-          currentUser={currentUser}
-          onClose={() => setIsUpgradeOpen(false)}
-          onSuccess={handleUpgradeSuccess}
-          onRequireLogin={() => {
-            setIsUpgradeOpen(false);
-            handleOpenAuthModal('login', targetPaidPlan?.id || 'pro');
-          }}
-        />
+        <Suspense
+          fallback={
+            <div className="min-h-screen flex items-center justify-center p-6">
+              <div className="flex flex-col items-center gap-3">
+                <div className="w-8 h-8 rounded-full border-2 border-emerald-500/30 border-t-emerald-600 animate-spin" />
+                <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">Memuat halaman...</span>
+              </div>
+            </div>
+          }
+        >
+          <LandingPage
+            plans={plans}
+            freeAutoReplyHours={freeAutoReplyHours}
+            onLoginSuccess={handleLoginSuccess}
+            onOpenAuthModal={handleOpenAuthModal}
+            onSelectPaidPlan={handleSelectPaidPlan}
+            isDarkMode={isDarkMode}
+            onToggleTheme={handleToggleTheme}
+            whitelabel={whitelabel}
+          />
+        </Suspense>
+        {isAuthOpen && (
+          <Suspense fallback={null}>
+            <AuthModal
+              isOpen={isAuthOpen}
+              mode={authMode}
+              defaultPlanId={selectedPlanId}
+              plans={plans}
+              onClose={() => setIsAuthOpen(false)}
+              onLoginSuccess={handleLoginSuccess}
+              onSwitchMode={(m) => setAuthMode(m)}
+              whitelabel={whitelabel}
+            />
+          </Suspense>
+        )}
+        {isUpgradeOpen && (
+          <Suspense fallback={null}>
+            <PaymentUpgradeModal
+              isOpen={isUpgradeOpen}
+              selectedPlan={targetPaidPlan}
+              plan={targetPaidPlan}
+              currentUser={currentUser}
+              onClose={() => setIsUpgradeOpen(false)}
+              onSuccess={handleUpgradeSuccess}
+              onRequireLogin={() => {
+                setIsUpgradeOpen(false);
+                handleOpenAuthModal('login', targetPaidPlan?.id || 'pro');
+              }}
+            />
+          </Suspense>
+        )}
       </div>
     );
   }
@@ -840,12 +906,13 @@ export function App() {
             </div>
           </div>
         ) : (
-          <>
+          <Suspense fallback={<ChunkLoaderFallback />}>
             {/* TAB 0: WHATSAPP CONNECT & BARCODE / PAIRING */}
             {activeTab === 'connect' && (
               <div>
                 <WhatsAppConnectPanel
                   currentUser={currentUser}
+                  initialSessions={sessions}
                   onSessionChange={fetchData}
                   onUpdateUser={(updated) => {
                     const normalized = normalizeUserClient(updated, currentUser);
@@ -983,7 +1050,7 @@ export function App() {
                 <SqlSchemaViewer />
               </div>
             )}
-          </>
+          </Suspense>
         )}
       </main>
 
@@ -1320,40 +1387,52 @@ export function App() {
         </div>
       </footer>
 
-      <AuthModal
-        isOpen={isAuthOpen}
-        mode={authMode}
-        defaultPlanId={selectedPlanId}
-        plans={plans}
-        onClose={() => setIsAuthOpen(false)}
-        onLoginSuccess={handleLoginSuccess}
-        onSwitchMode={(m) => setAuthMode(m)}
-        whitelabel={whitelabel}
-      />
+      {isAuthOpen && (
+        <Suspense fallback={null}>
+          <AuthModal
+            isOpen={isAuthOpen}
+            mode={authMode}
+            defaultPlanId={selectedPlanId}
+            plans={plans}
+            onClose={() => setIsAuthOpen(false)}
+            onLoginSuccess={handleLoginSuccess}
+            onSwitchMode={(m) => setAuthMode(m)}
+            whitelabel={whitelabel}
+          />
+        </Suspense>
+      )}
 
-      <PaymentUpgradeModal
-        isOpen={isUpgradeOpen}
-        selectedPlan={targetPaidPlan}
-        plan={targetPaidPlan}
-        currentUser={currentUser}
-        onClose={() => setIsUpgradeOpen(false)}
-        onSuccess={handleUpgradeSuccess}
-        onRequireLogin={() => {
-          setIsUpgradeOpen(false);
-          setAuthMode('login');
-          setIsAuthOpen(true);
-        }}
-      />
+      {isUpgradeOpen && (
+        <Suspense fallback={null}>
+          <PaymentUpgradeModal
+            isOpen={isUpgradeOpen}
+            selectedPlan={targetPaidPlan}
+            plan={targetPaidPlan}
+            currentUser={currentUser}
+            onClose={() => setIsUpgradeOpen(false)}
+            onSuccess={handleUpgradeSuccess}
+            onRequireLogin={() => {
+              setIsUpgradeOpen(false);
+              setAuthMode('login');
+              setIsAuthOpen(true);
+            }}
+          />
+        </Suspense>
+      )}
 
-      <SecurityPinModal
-        isOpen={isPinModalOpen}
-        user={currentUser}
-        onClose={() => setIsPinModalOpen(false)}
-        onSuccess={(updated) => {
-          setCurrentUser(updated);
-          fetchData();
-        }}
-      />
+      {isPinModalOpen && (
+        <Suspense fallback={null}>
+          <SecurityPinModal
+            isOpen={isPinModalOpen}
+            user={currentUser}
+            onClose={() => setIsPinModalOpen(false)}
+            onSuccess={(updated) => {
+              setCurrentUser(updated);
+              fetchData();
+            }}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

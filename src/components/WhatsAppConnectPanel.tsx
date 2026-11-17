@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import { apiFetch } from '../lib/csrfFetch';
 import {
   QrCode,
@@ -23,10 +23,14 @@ import {
   ShieldAlert,
   Bot,
   Sliders,
-  X
+  X,
+  Loader2
 } from 'lucide-react';
 import { WhatsAppSession, UserAccount } from '../types/whatsapp';
-import { MetaAiVerifyModal } from './MetaAiVerifyModal';
+
+const MetaAiVerifyModal = lazy(() =>
+  import('./MetaAiVerifyModal').then(m => ({ default: m.MetaAiVerifyModal }))
+);
 
 function normalizePhoneDigits(input?: string | null): string {
   if (!input) return '';
@@ -183,12 +187,20 @@ function SessionExpiryCountdown({
 
 interface WhatsAppConnectPanelProps {
   currentUser?: UserAccount | null;
+  initialSessions?: WhatsAppSession[];
   onSessionChange?: () => void;
   onUpdateUser?: (updatedUser: UserAccount) => void;
 }
 
-export function WhatsAppConnectPanel({ currentUser, onSessionChange, onUpdateUser }: WhatsAppConnectPanelProps) {
-  const [sessions, setSessions] = useState<WhatsAppSession[]>([]);
+export function WhatsAppConnectPanel({
+  currentUser,
+  initialSessions = [],
+  onSessionChange,
+  onUpdateUser
+}: WhatsAppConnectPanelProps) {
+  const [sessions, setSessions] = useState<WhatsAppSession[]>(initialSessions);
+  const [isLoadingSessions, setIsLoadingSessions] = useState<boolean>(initialSessions.length === 0);
+  const [isRefreshingSessions, setIsRefreshingSessions] = useState<boolean>(false);
   const [verifiedPhonesFromServer, setVerifiedPhonesFromServer] = useState<string[]>([]);
   const [metaAiVerifyTarget, setMetaAiVerifyTarget] = useState<{ sessionId: string; phoneNumber: string } | null>(null);
   const [reconnectingId, setReconnectingId] = useState<string | null>(null);
@@ -295,28 +307,41 @@ export function WhatsAppConnectPanel({ currentUser, onSessionChange, onUpdateUse
     setTimeout(() => setToastMsg(''), 3500);
   };
 
-  // Fetch connected sessions for current user (or all if admin)
-  const fetchSessions = useCallback(async () => {
+  // Fetch connected sessions immediately (decoupled from /api/ai/status so device list appears right away)
+  const fetchSessions = useCallback(async (opts?: { silent?: boolean }) => {
+    const isSilent = Boolean(opts?.silent);
+    if (!isSilent) {
+      setIsRefreshingSessions(true);
+      setSessions(prev => {
+        if (prev.length === 0) setIsLoadingSessions(true);
+        return prev;
+      });
+    }
     try {
-      const url = currentUser?.id ? `/api/sessions?userId=${currentUser.id}` : '/api/sessions';
-      const [sessRes, aiRes] = await Promise.all([
-        apiFetch(url),
-        currentUser?.id ? apiFetch('/api/ai/status').catch(() => null) : Promise.resolve(null)
-      ]);
+      const url = currentUser?.id ? `/api/sessions?userId=${encodeURIComponent(currentUser.id)}` : '/api/sessions';
+      if (currentUser?.id) {
+        void apiFetch('/api/ai/status')
+          .then(r => (r.ok ? r.json() : null))
+          .then(aiData => {
+            if (aiData?.success && Array.isArray(aiData.meta_ai_verified_phones)) {
+              setVerifiedPhonesFromServer(
+                aiData.meta_ai_verified_phones.map((p: string) => normalizePhoneDigits(p)).filter(Boolean)
+              );
+            }
+          })
+          .catch(() => {});
+      }
+
+      const sessRes = await apiFetch(url);
       const data = await sessRes.json();
       if (data.success) {
         setSessions(data.data || []);
       }
-      if (aiRes) {
-        const aiData = await aiRes.json().catch(() => null);
-        if (aiData?.success && Array.isArray(aiData.meta_ai_verified_phones)) {
-          setVerifiedPhonesFromServer(
-            aiData.meta_ai_verified_phones.map((p: string) => normalizePhoneDigits(p)).filter(Boolean)
-          );
-        }
-      }
     } catch (err) {
       console.error('Gagal mengambil daftar sesi WA:', err);
+    } finally {
+      setIsLoadingSessions(false);
+      setIsRefreshingSessions(false);
     }
   }, [currentUser?.id]);
 
@@ -413,6 +438,19 @@ export function WhatsAppConnectPanel({ currentUser, onSessionChange, onUpdateUse
   useEffect(() => {
     fetchSessions();
   }, [fetchSessions]);
+
+  // Auto-poll silently when any linked device is reconnecting so status updates to Online immediately
+  const hasConnectingSession = sessions.some(
+    s => (s.runtime_status || s.status) === 'connecting'
+  );
+  useEffect(() => {
+    if (!hasConnectingSession && !reconnectingId) return;
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      fetchSessions({ silent: true });
+    }, 3500);
+    return () => clearInterval(timer);
+  }, [hasConnectingSession, reconnectingId, fetchSessions]);
 
   // Only start QR socket when user explicitly switches to the QR tab
   useEffect(() => {
@@ -916,6 +954,12 @@ export function WhatsAppConnectPanel({ currentUser, onSessionChange, onUpdateUse
             <h3 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white truncate">
               Perangkat Tertaut ({sessions.length})
             </h3>
+            {(isLoadingSessions || isRefreshingSessions) && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-200/80 dark:border-emerald-500/30">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                <span>Memuat...</span>
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
@@ -932,16 +976,50 @@ export function WhatsAppConnectPanel({ currentUser, onSessionChange, onUpdateUse
             )}
             <button
               type="button"
-              onClick={fetchSessions}
-              className="w-9 h-9 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-xl flex items-center justify-center"
+              onClick={() => fetchSessions()}
+              disabled={isLoadingSessions || isRefreshingSessions}
+              className="w-9 h-9 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-xl flex items-center justify-center disabled:opacity-60"
               aria-label="Refresh Sesi"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
+              <RefreshCw className={`w-3.5 h-3.5 ${isLoadingSessions || isRefreshingSessions ? 'animate-spin text-emerald-600' : ''}`} />
             </button>
           </div>
         </div>
 
-        {sessions.length === 0 ? (
+        {isRefreshingSessions && sessions.length > 0 && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-50/80 dark:bg-emerald-950/30 border border-emerald-200/80 dark:border-emerald-800/60 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+            <span>Memperbarui status koneksi perangkat terhubung...</span>
+          </div>
+        )}
+
+        {isLoadingSessions && sessions.length === 0 ? (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs font-semibold text-slate-600 dark:text-slate-300">
+              <Loader2 className="w-4 h-4 text-emerald-600 animate-spin shrink-0" />
+              <span>Sedang memuat daftar perangkat WhatsApp terhubung...</span>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+              {[0, 1].map((idx) => (
+                <div
+                  key={idx}
+                  className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/70 space-y-3 animate-pulse"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <div className="w-2.5 h-2.5 rounded-full bg-emerald-300 dark:bg-emerald-700" />
+                      <div className="h-4 w-32 bg-slate-200 dark:bg-slate-800 rounded-md" />
+                    </div>
+                    <div className="h-5 w-16 bg-slate-200 dark:bg-slate-800 rounded-full" />
+                  </div>
+                  <div className="h-9 w-full bg-slate-200/80 dark:bg-slate-800/80 rounded-xl" />
+                  <div className="h-8 w-full bg-slate-200/60 dark:bg-slate-800/60 rounded-xl" />
+                  <div className="h-10 w-full bg-slate-200/70 dark:bg-slate-800/70 rounded-xl" />
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : sessions.length === 0 ? (
           <div className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-2xl p-8 text-center space-y-1.5">
             <Smartphone className="w-8 h-8 text-slate-400 mx-auto opacity-60" />
             <p className="text-xs text-slate-700 dark:text-slate-300 font-bold">Belum ada perangkat terhubung</p>
@@ -1260,24 +1338,28 @@ export function WhatsAppConnectPanel({ currentUser, onSessionChange, onUpdateUse
         </div>
       )}
       {/* Meta AI Verification & Initial Chat Trigger Modal */}
-      <MetaAiVerifyModal
-        isOpen={Boolean(metaAiVerifyTarget)}
-        onClose={() => setMetaAiVerifyTarget(null)}
-        sessionId={metaAiVerifyTarget?.sessionId}
-        phoneNumber={metaAiVerifyTarget?.phoneNumber}
-        autoEnableOnSuccess={true}
-        onVerified={(payload) => {
-          const clean = normalizePhoneDigits(payload.phone_number || metaAiVerifyTarget?.phoneNumber);
-          if (clean) {
-            setVerifiedPhonesFromServer(prev => (prev.includes(clean) ? prev : [...prev, clean]));
-          }
-          if (payload.user && onUpdateUser) {
-            onUpdateUser(payload.user);
-          }
-          if (onSessionChange) onSessionChange();
-          showToast('✓ Meta AI berhasil diverifikasi dan siap membalas otomatis!');
-        }}
-      />
+      {metaAiVerifyTarget && (
+        <Suspense fallback={null}>
+          <MetaAiVerifyModal
+            isOpen={Boolean(metaAiVerifyTarget)}
+            onClose={() => setMetaAiVerifyTarget(null)}
+            sessionId={metaAiVerifyTarget?.sessionId}
+            phoneNumber={metaAiVerifyTarget?.phoneNumber}
+            autoEnableOnSuccess={true}
+            onVerified={(payload) => {
+              const clean = normalizePhoneDigits(payload.phone_number || metaAiVerifyTarget?.phoneNumber);
+              if (clean) {
+                setVerifiedPhonesFromServer(prev => (prev.includes(clean) ? prev : [...prev, clean]));
+              }
+              if (payload.user && onUpdateUser) {
+                onUpdateUser(payload.user);
+              }
+              if (onSessionChange) onSessionChange();
+              showToast('✓ Meta AI berhasil diverifikasi dan siap membalas otomatis!');
+            }}
+          />
+        </Suspense>
+      )}
 
       {/* Hybrid Per-Device AI Configuration Modal */}
       {aiConfigSession && (

@@ -106,10 +106,20 @@ async function resolveBaileysVersion(): Promise<[number, number, number]> {
 function isSocketTrulyOpen(sock: any): boolean {
   if (!sock) return false;
   if (sock.ws) {
+    if (sock.ws.isClosed === true) return false;
     if (typeof sock.ws.isOpen === 'boolean') return sock.ws.isOpen;
     if (typeof sock.ws.readyState === 'number') return sock.ws.readyState === 1;
+    if (typeof sock.ws.socket?.readyState === 'number') return sock.ws.socket.readyState === 1;
   }
   return true;
+}
+
+function isSocketConnecting(sock: any): boolean {
+  if (!sock?.ws) return false;
+  if (typeof sock.ws.isConnecting === 'boolean') return sock.ws.isConnecting;
+  if (typeof sock.ws.readyState === 'number') return sock.ws.readyState === 0;
+  if (typeof sock.ws.socket?.readyState === 'number') return sock.ws.socket.readyState === 0;
+  return false;
 }
 
 // Normalize phone number to international WhatsApp format (e.g. 0812..., 812..., +62812... -> 62812...)
@@ -159,10 +169,10 @@ const inFlightExpiryAlerts = new Set<string>();
 const AUTH_DIR = path.resolve(process.cwd(), 'baileys_auth_sessions');
 const UNSCANNED_HANDSHAKE_TTL_MS = 3 * 60 * 1000;
 const FREE_IDLE_SOCKET_TTL_MS = 3 * 60 * 1000;
-const MAX_RECONNECT_RETRIES = 5;
+const MAX_RECONNECT_RETRIES = 10;
 const AUTH_BACKUP_DEBOUNCE_MS = 30000;
 const AUTH_BACKUP_COOLDOWN_MS = 120000;
-const PRUNE_COOLDOWN_MS = 90000;
+const PRUNE_COOLDOWN_MS = 120000;
 const MYSQL_AUTH_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
 const SESSION_EXPIRY_ALERT_GRACE_MS = 60 * 60 * 1000; // Tunggu 1 jam sebelum kirim WA pengingat kedaluwarsa
 
@@ -488,10 +498,11 @@ export function buildBaileysSocketConfig(version: [number, number, number], logg
         jid.endsWith('@newsletter')
       );
     },
-    connectTimeoutMs: 30000,
-    defaultQueryTimeoutMs: 30000,
-    keepAliveIntervalMs: 30000,
-    retryRequestDelayMs: 2000,
+    connectTimeoutMs: 45000,
+    defaultQueryTimeoutMs: 45000,
+    keepAliveIntervalMs: 15000,
+    qrTimeout: 60000,
+    retryRequestDelayMs: 2500,
     maxMsgRetryCount: 2,
     transactionOpts: {
       maxCommitRetries: 5,
@@ -1898,11 +1909,88 @@ function attachSocketMessageListener(sock: any, sessionId: string, sessionData: 
   });
 }
 
+function closeSocketSafelyWithoutLogout(sock: any, sessionData?: SessionState | null, sessionId?: string) {
+  if (sock) {
+    try {
+      sock.ev?.removeAllListeners?.('connection.update');
+      sock.ev?.removeAllListeners?.('creds.update');
+      sock.ev?.removeAllListeners?.('messages.upsert');
+      sock.ev?.removeAllListeners?.('messages.update');
+      sock.end?.(undefined);
+      sock.ws?.removeAllListeners?.();
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+  sessionData?.detachRawHandlers?.();
+  if (sessionId) {
+    clearMetaAiSession(sessionId);
+  }
+}
+
+/**
+ * Mencegah dua folder/socket berbeda milik akun & nomor WA yang sama saling menendang (440 connectionReplaced).
+ */
+function cleanupDuplicateSessionsForOwnerPhone(keepSessionId: string, ownerUserId: string, cleanPhone: string) {
+  if (!keepSessionId || !cleanPhone || cleanPhone.length < 8) return;
+
+  for (const [sid, mem] of Array.from(activeSessions.entries())) {
+    if (sid === keepSessionId) continue;
+    const memPhone = normalizePhoneNumber(mem.phoneNumber || getCredsPhoneOnDisk(sid) || '');
+    const sameUser = !mem.userId || !ownerUserId || mem.userId === ownerUserId || isSessionOwnedByUserId(sid, ownerUserId);
+    if (sameUser && memPhone === cleanPhone) {
+      console.log(`[Baileys Dedup] Menutup socket duplikat "${sid}" untuk +${cleanPhone} (mempertahankan "${keepSessionId}").`);
+      clearSessionTimers(sid);
+      closeSocketSafelyWithoutLogout(mem.socket, mem, sid);
+      activeSessions.delete(sid);
+      cleanSessionFolder(sid);
+      deleteBaileysAuthFromMysql(sid).catch(() => {});
+    }
+  }
+
+  if (fs.existsSync(AUTH_DIR)) {
+    try {
+      for (const folder of fs.readdirSync(AUTH_DIR)) {
+        if (folder === keepSessionId) continue;
+        const folderPhone = getCredsPhoneOnDisk(folder);
+        if (folderPhone !== cleanPhone) continue;
+        const dbMeta = getSessionById(folder);
+        const sameOwner =
+          (dbMeta?.user_id && dbMeta.user_id === ownerUserId) ||
+          isSessionOwnedByUserId(folder, ownerUserId);
+        if (sameOwner) {
+          console.log(`[Baileys Dedup] Menghapus folder auth duplikat "${folder}" untuk +${cleanPhone}.`);
+          clearSessionTimers(folder);
+          cleanSessionFolder(folder);
+          deleteBaileysAuthFromMysql(folder).catch(() => {});
+        }
+      }
+    } catch {
+      // Ignore readdir errors
+    }
+  }
+}
+
+function hasOtherConnectedSocketForPhone(excludeSessionId: string, cleanPhone: string, ownerUserId?: string): boolean {
+  if (!cleanPhone || cleanPhone.length < 8) return false;
+  for (const [sid, mem] of activeSessions.entries()) {
+    if (sid === excludeSessionId) continue;
+    if (mem.status !== 'connected' || !isSocketTrulyOpen(mem.socket)) continue;
+    const memPhone = normalizePhoneNumber(mem.phoneNumber || '');
+    if (memPhone !== cleanPhone) continue;
+    if (!ownerUserId || !mem.userId || mem.userId === ownerUserId || isSessionOwnedByUserId(sid, ownerUserId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Start or get active Baileys socket for QR Code or persistent session
 export async function getOrStartBaileysSession(
   rawSessionId: string = 'session_primary_default',
   phoneNumber?: string,
-  userId?: string
+  userId?: string,
+  options?: { forceReconnect?: boolean }
 ): Promise<SessionState> {
   const sessionId = sanitizeSessionId(rawSessionId);
   const existing = activeSessions.get(sessionId);
@@ -1912,12 +2000,14 @@ export async function getOrStartBaileysSession(
     return existing;
   }
 
-  // If currently connecting within the last 30 seconds and socket is still alive, do not kill the handshake
+  // If currently connecting/reconnecting within the last 45 seconds, do NOT kill the in-flight handshake or backoff timer
   if (
+    !options?.forceReconnect &&
     existing &&
     existing.status === 'connecting' &&
-    existing.socket &&
-    Date.now() - existing.lastUpdated < 30000
+    (existing.socket && (isSocketTrulyOpen(existing.socket) || isSocketConnecting(existing.socket))
+      ? Date.now() - existing.lastUpdated < 60000
+      : Date.now() - existing.lastUpdated < 45000 && reconnectTimers.has(sessionId))
   ) {
     if (userId && !existing.userId) existing.userId = userId;
     return existing;
@@ -1934,20 +2024,9 @@ export async function getOrStartBaileysSession(
       clearSessionTimers(sessionId);
 
       const current = activeSessions.get(sessionId);
-      const prevRetries = current?.retryCount || 0;
+      const prevRetries = options?.forceReconnect ? 0 : (current?.retryCount || 0);
       if (current && current.socket) {
-        try {
-          current.socket.ev?.removeAllListeners?.('connection.update');
-          current.socket.ev?.removeAllListeners?.('creds.update');
-          current.socket.ev?.removeAllListeners?.('messages.upsert');
-          current.socket.ev?.removeAllListeners?.('messages.update');
-          current.socket.end(undefined);
-          current.socket.ws?.removeAllListeners?.();
-        } catch {
-          // Ignore
-        }
-        current.detachRawHandlers?.();
-        clearMetaAiSession(sessionId);
+        closeSocketSafelyWithoutLogout(current.socket, current, sessionId);
         activeSessions.delete(sessionId);
       }
 
@@ -1970,6 +2049,9 @@ export async function getOrStartBaileysSession(
       const version = await resolveBaileysVersion();
 
       const sock = makeWASocket(buildBaileysSocketConfig(version, BAILEYS_SILENT_LOGGER, state));
+      try {
+        sock.ws?.on?.('error', () => {});
+      } catch {}
 
       const sessionData: SessionState = {
         sessionId,
@@ -2036,11 +2118,13 @@ export async function getOrStartBaileysSession(
           sessionData.qrCodeUrl = null;
           sessionData.pairingCode = null;
           sessionData.lastUpdated = Date.now();
+          sessionData.handshakeStartedAt = Date.now();
           sessionData.retryCount = 0;
           sessionData.disconnectedSince = undefined;
           sessionData.userId = owner!.id;
           sessionData.is_primary = Boolean(getSessionById(sessionId)?.is_primary);
           clearSessionExpiryNotificationCooldown(sessionId, owner!.id, connectedUser);
+          cleanupDuplicateSessionsForOwnerPhone(sessionId, owner!.id, connectedUser);
           activeSessions.set(sessionId, sessionData);
           scheduleAuthFolderBackup(sessionId, true);
 
@@ -2156,8 +2240,24 @@ export async function getOrStartBaileysSession(
           }
 
           const ownerArStatus = getUserAutoReplyStatus(owner);
+          const cleanSockPhone = normalizePhoneNumber(sessionData.phoneNumber || getCredsPhoneOnDisk(sessionId) || '');
+          if (
+            statusCode === DisconnectReason.connectionReplaced &&
+            cleanSockPhone &&
+            hasOtherConnectedSocketForPhone(sessionId, cleanSockPhone, owner!.id)
+          ) {
+            console.log(`[Baileys Dedup] Socket ${sessionId} digantikan oleh sesi aktif lain untuk +${cleanSockPhone}; menghentikan duplikat tanpa memutus sesi utama.`);
+            clearSessionTimers(sessionId);
+            clearMetaAiSession(sessionId);
+            activeSessions.delete(sessionId);
+            return;
+          }
 
-          sessionData.retryCount = (sessionData.retryCount || 0) + 1;
+          const isRestartRequired = statusCode === DisconnectReason.restartRequired;
+          if (!isRestartRequired) {
+            sessionData.retryCount = (sessionData.retryCount || 0) + 1;
+          }
+
           if (sessionData.retryCount > MAX_RECONNECT_RETRIES) {
             clearSessionTimers(sessionId);
             clearMetaAiSession(sessionId);
@@ -2170,6 +2270,7 @@ export async function getOrStartBaileysSession(
               // Keep registered credentials & DB session intact so watchdog heals cleanly without forcing re-scan
               console.warn(`[Baileys Keep-Alive] Sesi terdaftar ${sessionId} mencapai batas retry cepat (${MAX_RECONNECT_RETRIES}x). Menyimpan kredensial untuk pemulihan watchdog otomatis.`);
               sessionData.status = 'disconnected';
+              sessionData.lastUpdated = Date.now();
               sessionData.disconnectedSince = sessionData.disconnectedSince || Date.now();
               sessionData.retryCount = 0;
               activeSessions.set(sessionId, sessionData);
@@ -2181,13 +2282,15 @@ export async function getOrStartBaileysSession(
           }
 
           sessionData.status = 'connecting';
+          sessionData.lastUpdated = Date.now();
           activeSessions.set(sessionId, sessionData);
-          const reconnectDelay =
-            statusCode === DisconnectReason.connectionReplaced
-              ? 6000
-              : Math.min(30000, 2000 * Math.pow(2, Math.max(0, sessionData.retryCount - 1)));
+          const reconnectDelay = isRestartRequired
+            ? 1200
+            : statusCode === DisconnectReason.connectionReplaced
+              ? 9000 + crypto.randomInt(0, 4000)
+              : Math.min(30000, 1500 * Math.pow(1.6, Math.max(0, sessionData.retryCount - 1)));
           console.log(
-            `[Baileys Auto-Reconnect] Menghubungkan ulang sesi ${sessionId} dalam ${reconnectDelay}ms (percobaan ${sessionData.retryCount}/${MAX_RECONNECT_RETRIES})...`
+            `[Baileys Auto-Reconnect] Menghubungkan ulang sesi ${sessionId} dalam ${Math.round(reconnectDelay)}ms (percobaan ${sessionData.retryCount}/${MAX_RECONNECT_RETRIES})...`
           );
           clearSessionTimers(sessionId);
           const rTimer = setTimeout(async () => {
@@ -2202,7 +2305,8 @@ export async function getOrStartBaileysSession(
             getOrStartBaileysSession(
               sessionId,
               phoneNumber || sessionData.phoneNumber || undefined,
-              sessionData.userId
+              sessionData.userId,
+              { forceReconnect: true }
             ).catch(() => {});
           }, reconnectDelay);
           reconnectTimers.set(sessionId, rTimer);
@@ -2318,10 +2422,12 @@ export async function requestBaileysPairingCode(
       sessionData.phoneNumber = connectedUser;
       sessionData.pairingCode = null;
       sessionData.lastUpdated = Date.now();
+      sessionData.handshakeStartedAt = Date.now();
       sessionData.retryCount = 0;
       sessionData.disconnectedSince = undefined;
       sessionData.userId = owner!.id;
       clearSessionExpiryNotificationCooldown(sessionId, owner!.id, connectedUser);
+      cleanupDuplicateSessionsForOwnerPhone(sessionId, owner!.id, connectedUser);
       activeSessions.set(sessionId, sessionData);
       scheduleAuthFolderBackup(sessionId, true);
 
@@ -2419,7 +2525,21 @@ export async function requestBaileysPairingCode(
       const pairOwner = resolveActiveVerifiedOwner(sessionId, sessionData.userId || userId, sessionData.phoneNumber || cleanPhone);
       const pairArStatus = pairOwner ? getUserAutoReplyStatus(pairOwner) : null;
 
-      sessionData.retryCount = (sessionData.retryCount || 0) + 1;
+      if (
+        statusCode === DisconnectReason.connectionReplaced &&
+        cleanPhone &&
+        hasOtherConnectedSocketForPhone(sessionId, cleanPhone, pairOwner?.id || userId)
+      ) {
+        clearSessionTimers(sessionId);
+        clearMetaAiSession(sessionId);
+        activeSessions.delete(sessionId);
+        return;
+      }
+
+      const isPairRestartRequired = statusCode === DisconnectReason.restartRequired;
+      if (!isPairRestartRequired) {
+        sessionData.retryCount = (sessionData.retryCount || 0) + 1;
+      }
       if (sessionData.retryCount > MAX_RECONNECT_RETRIES) {
         clearSessionTimers(sessionId);
         clearMetaAiSession(sessionId);
@@ -2430,6 +2550,7 @@ export async function requestBaileysPairingCode(
           }
           console.warn(`[Baileys Pairing Keep-Alive] Sesi terdaftar ${sessionId} menyimpan kredensial untuk pemulihan watchdog.`);
           sessionData.status = 'disconnected';
+          sessionData.lastUpdated = Date.now();
           sessionData.disconnectedSince = sessionData.disconnectedSince || Date.now();
           sessionData.retryCount = 0;
           activeSessions.set(sessionId, sessionData);
@@ -2440,18 +2561,24 @@ export async function requestBaileysPairingCode(
       }
 
       sessionData.status = 'connecting';
+      sessionData.lastUpdated = Date.now();
       activeSessions.set(sessionId, sessionData);
       console.log(
         `[Baileys Pairing] Stream closed (${statusCode}). Flushing credentials and reconnecting ${sessionId}...`
       );
       clearSessionTimers(sessionId);
+      const pairReconnectDelay = isPairRestartRequired
+        ? 1200
+        : statusCode === DisconnectReason.connectionReplaced
+          ? 9000 + crypto.randomInt(0, 4000)
+          : 2000;
       const rTimer = setTimeout(async () => {
         reconnectTimers.delete(sessionId);
         try {
           await pairCredsSaveQueue;
         } catch {}
-        getOrStartBaileysSession(sessionId, cleanPhone, sessionData.userId || userId).catch(() => {});
-      }, 1500);
+        getOrStartBaileysSession(sessionId, cleanPhone, sessionData.userId || userId, { forceReconnect: true }).catch(() => {});
+      }, pairReconnectDelay);
       reconnectTimers.set(sessionId, rTimer);
     }
   });
@@ -2563,6 +2690,17 @@ export async function reconnectBaileysSessionForUser(
   const effectiveId = dbSess?.id || sessionId;
   const targetUserId = userId || dbSess?.user_id;
 
+  const liveNow = findLiveSocketEntry(targetUserId, effectiveId);
+  if (liveNow) {
+    return {
+      connected: true,
+      runtime_status: 'connected',
+      needs_rescan: false,
+      session_id: liveNow.sessionId,
+      phone_number: liveNow.phoneNumber || dbSess?.phone_number
+    };
+  }
+
   let hasCreds = hasRegisteredCredsOnDisk(effectiveId);
   if (!hasCreds) {
     hasCreds = await hydrateSessionAuthFolderFromMysql(effectiveId).catch(() => false);
@@ -2583,14 +2721,37 @@ export async function reconnectBaileysSessionForUser(
     };
   }
 
-  const ensured = await ensureConnectedSessionForUser(targetUserId, effectiveId);
-  if (ensured) {
+  const startedState = await getOrStartBaileysSession(
+    effectiveId,
+    dbSess?.phone_number,
+    targetUserId,
+    { forceReconnect: true }
+  );
+
+  let tries = 0;
+  while (tries < 18 && startedState.status === 'connecting') {
+    await delay(400);
+    const ready = findLiveSocketEntry(targetUserId, effectiveId);
+    if (ready) {
+      return {
+        connected: true,
+        runtime_status: 'connected',
+        needs_rescan: false,
+        session_id: ready.sessionId,
+        phone_number: ready.phoneNumber || dbSess?.phone_number
+      };
+    }
+    tries++;
+  }
+
+  const afterWait = findLiveSocketEntry(targetUserId, effectiveId);
+  if (afterWait) {
     return {
       connected: true,
       runtime_status: 'connected',
       needs_rescan: false,
-      session_id: ensured.sessionId,
-      phone_number: ensured.phoneNumber || dbSess?.phone_number
+      session_id: afterWait.sessionId,
+      phone_number: afterWait.phoneNumber || dbSess?.phone_number
     };
   }
 
@@ -3139,13 +3300,42 @@ export async function restoreSavedBaileysSessions() {
       }
     });
 
+    // Deduplicate candidate session IDs by (owner.id, phone) so we NEVER launch two sockets for the same WhatsApp number
+    const dedupedByOwnerPhone = new Map<string, string>();
+    for (const sid of sessionIdsToRestore) {
+      const dbSess = getSessionById(sid);
+      const phone = normalizePhoneNumber(dbSess?.phone_number || getCredsPhoneOnDisk(sid) || '');
+      const owner = resolveActiveVerifiedOwner(sid, dbSess?.user_id, phone);
+      if (!owner) continue;
+      const dedupKey = phone ? `${owner.id}:${phone}` : sid;
+      const existingSid = dedupedByOwnerPhone.get(dedupKey);
+      if (!existingSid) {
+        dedupedByOwnerPhone.set(dedupKey, sid);
+      } else {
+        const existingIsDb = Boolean(getSessionById(existingSid));
+        const currentIsDb = Boolean(dbSess);
+        if (!existingIsDb && currentIsDb) {
+          dedupedByOwnerPhone.set(dedupKey, sid);
+        }
+      }
+    }
+    const finalSessionIdsToRestore = Array.from(dedupedByOwnerPhone.values());
+    for (const sid of finalSessionIdsToRestore) {
+      const dbSess = getSessionById(sid);
+      const phone = normalizePhoneNumber(dbSess?.phone_number || getCredsPhoneOnDisk(sid) || '');
+      const owner = resolveActiveVerifiedOwner(sid, dbSess?.user_id, phone);
+      if (owner && phone) {
+        cleanupDuplicateSessionsForOwnerPhone(sid, owner.id, phone);
+      }
+    }
+
     console.log(
-      `[Baileys Persistent Storage] Found ${sessionIdsToRestore.size} active WhatsApp session(s) to restore (skipped ${skippedIdleFreeIds.size} idle free session(s) to save RAM).`
+      `[Baileys Persistent Storage] Found ${finalSessionIdsToRestore.length} active WhatsApp session(s) to restore (skipped ${skippedIdleFreeIds.size} idle free session(s) to save RAM).`
     );
 
     // Notify owners only for genuinely broken/expired sessions (never mark idle free Blast/API standby sessions as disconnected)
     for (const s of dbSessions) {
-      if (s.id && s.status === 'connected' && !sessionIdsToRestore.has(s.id)) {
+      if (s.id && s.status === 'connected' && !finalSessionIdsToRestore.includes(s.id)) {
         if (skippedIdleFreeIds.has(s.id)) continue;
         updateSession(s.id, { status: 'disconnected' });
         const owner = resolveActiveVerifiedOwner(s.id, s.user_id, s.phone_number);
@@ -3163,7 +3353,7 @@ export async function restoreSavedBaileysSessions() {
       }
     }
 
-    for (const sid of sessionIdsToRestore) {
+    for (const sid of finalSessionIdsToRestore) {
       const existing = activeSessions.get(sid);
       if (!existing || existing.status !== 'connected' || !isSocketTrulyOpen(existing.socket)) {
         try {
@@ -3214,7 +3404,7 @@ export async function runBaileysPeriodicHealthCheck(): Promise<{
     }
 
     const isConnectingRecently =
-      mem && mem.status === 'connecting' && now - mem.lastUpdated < 35000;
+      mem && mem.status === 'connecting' && now - mem.lastUpdated < 45000;
     if (isConnectingRecently) continue;
 
     const owner = resolveActiveVerifiedOwner(s.id, s.user_id, s.phone_number);
@@ -3280,10 +3470,10 @@ export async function runBaileysPeriodicHealthCheck(): Promise<{
   return { checked, healed, notified };
 }
 
-// Background Keep-Alive, Auto-Heal, Expiry Check & Notification Watchdog (every 120s)
+// Background Keep-Alive, Auto-Heal, Expiry Check & Notification Watchdog (every 45s)
 const baileysWatchdogTimer = setInterval(() => {
   runBaileysPeriodicHealthCheck().catch(() => {});
-}, 120000);
+}, 45000);
 baileysWatchdogTimer.unref?.();
 
 export function shutdownBaileysManager(): void {
