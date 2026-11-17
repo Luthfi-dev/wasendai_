@@ -289,7 +289,7 @@ export function replaceRuntimeDatabaseFromMysql(remote: any): void {
         is_primary: Boolean(rs.is_primary),
         ai_enabled: resolvedAiEnabled,
         custom_system_prompt: resolvedCustomPrompt,
-        connected_at: rs.connected_at || local?.connected_at || new Date().toISOString(),
+        connected_at: rs.connected_at || local?.connected_at || (resolvedStatus === 'connected' ? new Date().toISOString() : undefined),
         expires_at:
           rs.expires_at ||
           local?.expires_at ||
@@ -297,7 +297,11 @@ export function replaceRuntimeDatabaseFromMysql(remote: any): void {
       };
     });
     for (const localSess of db.sessions) {
-      if (localSess.id && !remoteIds.has(localSess.id) && localSess.status === 'connected') {
+      if (
+        localSess.id &&
+        !remoteIds.has(localSess.id) &&
+        (localSess.status === 'connected' || Boolean(localSess.connected_at))
+      ) {
         mergedSessions.push(localSess);
       }
     }
@@ -2400,17 +2404,21 @@ export function getWhatsAppSessions(): WhatsAppSession[] {
 
 export function getSessionById(id: string): WhatsAppSession | null {
   const db = initDbFile();
-  const direct = db.sessions.find(s => s.id === id);
+  const cleanId = String(id || '').trim();
+  if (!cleanId) return null;
+  const direct = db.sessions.find(s => s.id === cleanId);
   if (direct) return direct;
-  const cleanDigits = id ? normalizePhoneForUniqueness(id) : '';
-  if (cleanDigits.length >= 8) {
-    return (
-      db.sessions.find(
-        s => s.phone_number && normalizePhoneForUniqueness(s.phone_number) === cleanDigits
-      ) || null
-    );
+  if (/^\+?\d{8,16}$/.test(cleanId)) {
+    const cleanDigits = normalizePhoneForUniqueness(cleanId);
+    if (cleanDigits.length >= 8) {
+      return (
+        db.sessions.find(
+          s => s.phone_number && normalizePhoneForUniqueness(s.phone_number) === cleanDigits
+        ) || null
+      );
+    }
   }
-  return db.sessions.find(s => s.phone_number === id) || null;
+  return db.sessions.find(s => s.phone_number === cleanId) || null;
 }
 
 export function isSessionOwnedByUserId(sessionId?: string | null, userId?: string | null): boolean {
@@ -2513,10 +2521,14 @@ export function addWhatsAppSession(sessionData: Omit<WhatsAppSession, 'id' | 'cr
       status: sessionData.status || existing.status,
       user_id: resolvedOwnerId,
       session_name: sessionData.session_name || existing.session_name,
+      connected_at:
+        sessionData.connected_at ||
+        existing.connected_at ||
+        (sessionData.status === 'connected' ? new Date().toISOString() : undefined),
       expires_at: sessionData.expires_at || existing.expires_at || defaultExpiry,
       updated_at: new Date().toISOString()
     };
-    writeDbFile(db);
+    writeDbFile(db, true);
     asyncSyncSession(db.sessions[existingIndex]);
     return db.sessions[existingIndex];
   }
@@ -2527,6 +2539,9 @@ export function addWhatsAppSession(sessionData: Omit<WhatsAppSession, 'id' | 'cr
     user_id: targetUserId,
     phone_number: cleanPhone || sessionData.phone_number,
     id: sessionData.id || `sess_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+    connected_at:
+      sessionData.connected_at ||
+      (sessionData.status === 'connected' ? new Date().toISOString() : undefined),
     expires_at: sessionData.expires_at || defaultExpiry,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString()
@@ -2593,20 +2608,34 @@ export function updateWhatsAppSession(id: string, updates: Partial<WhatsAppSessi
 
 export function deleteWhatsAppSession(id: string): boolean {
   const db = initDbFile();
+  const cleanId = String(id || '').trim();
+  if (!cleanId) return false;
   const initialLength = db.sessions.length;
 
-  const targetSession = db.sessions.find(s => s.id === id || s.phone_number === id);
-  const targetPhone = targetSession?.phone_number ? targetSession.phone_number.replace(/\D/g, '') : '';
+  const isPhoneInput = /^\+?\d{8,16}$/.test(cleanId);
+  const inputPhoneNorm = isPhoneInput ? normalizePhoneForUniqueness(cleanId) : '';
+  const targetSession = db.sessions.find(
+    s =>
+      s.id === cleanId ||
+      (isPhoneInput && s.phone_number && normalizePhoneForUniqueness(s.phone_number) === inputPhoneNorm)
+  );
+  const targetPhone = targetSession?.phone_number
+    ? normalizePhoneForUniqueness(targetSession.phone_number)
+    : inputPhoneNorm;
 
   db.sessions = db.sessions.filter(s => {
-    if (s.id === id) return false;
-    if (targetPhone && s.phone_number && s.phone_number.replace(/\D/g, '') === targetPhone) return false;
+    if (s.id === cleanId) return false;
+    if (targetPhone && s.phone_number) {
+      const sPhone = normalizePhoneForUniqueness(s.phone_number);
+      const sameOwner = !targetSession?.user_id || !s.user_id || s.user_id === targetSession.user_id;
+      if (sPhone === targetPhone && sameOwner) return false;
+    }
     return true;
   });
 
   if (db.sessions.length !== initialLength) {
-    writeDbFile(db);
-    asyncDeleteSession(targetSession?.id || id, targetPhone || undefined);
+    writeDbFile(db, true);
+    asyncDeleteSession(targetSession?.id || cleanId, targetPhone || undefined);
     return true;
   }
   return false;

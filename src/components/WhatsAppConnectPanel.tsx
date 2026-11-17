@@ -452,14 +452,14 @@ export function WhatsAppConnectPanel({
     return () => clearInterval(timer);
   }, [hasConnectingSession, reconnectingId, fetchSessions]);
 
-  // Only start QR socket when user explicitly switches to the QR tab
+  const isAnySessionConnected = sessions.some(s => s.status === 'connected');
+
+  // Only start QR socket when user explicitly switches to the QR tab and has no connected device yet
   useEffect(() => {
-    if (loginMethod === 'qr') {
+    if (loginMethod === 'qr' && !isAnySessionConnected) {
       fetchQrCode();
     }
-  }, [loginMethod, fetchQrCode]);
-
-  const isAnySessionConnected = sessions.some(s => s.status === 'connected');
+  }, [loginMethod, isAnySessionConnected, fetchQrCode]);
 
   // QR Countdown Timer auto refresh - only if on QR tab and not already connected
   useEffect(() => {
@@ -521,7 +521,6 @@ export function WhatsAppConnectPanel({
           setActivePairingSessionId(data.session_id);
         }
         showToast('🔑 Kode Pairing berhasil dibuat! Masukkan 8 digit kode ini di WhatsApp HP Anda.');
-        fetchSessions();
       } else {
         setPairError(data.details || data.error || 'Gagal meminta Kode Pairing dari WhatsApp.');
       }

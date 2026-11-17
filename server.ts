@@ -3527,25 +3527,30 @@ app.get('/api/sessions', requireAuth, (req, res) => {
       : getSessionsByUserId(authUser.id);
 
   const now = Date.now();
-  const enriched = rawSessions.map((s) => {
-    const runtime = getLiveSessionRuntimeStatus(s);
-    const isSessionExpired = Boolean(s.expires_at && Number.isFinite(Date.parse(s.expires_at)) && Date.parse(s.expires_at) < now);
-    const owner = s.user_id ? getUserById(s.user_id) : authUser;
-    const ownerAr = owner ? getUserAutoReplyStatus(owner) : null;
-    const shouldWakeSession =
-      !isSessionExpired &&
-      s.status === 'connected' &&
-      runtime.runtime_status === 'disconnected' &&
-      (owner?.role === 'admin' || !ownerAr?.is_free_plan || ownerAr.allowed);
-    if (shouldWakeSession) {
-      void ensureConnectedSessionForUser(s.user_id || authUser.id, s.id).catch(() => {});
-    }
-    return {
-      ...sanitizeSessionForClient(s),
-      runtime_status: runtime.runtime_status,
-      has_registered_creds: runtime.has_registered_creds
-    };
-  });
+  const enriched = rawSessions
+    .map((s) => {
+      const runtime = getLiveSessionRuntimeStatus(s);
+      if (s.status === 'connecting' && !s.connected_at && !runtime.has_registered_creds) {
+        return null;
+      }
+      const isSessionExpired = Boolean(s.expires_at && Number.isFinite(Date.parse(s.expires_at)) && Date.parse(s.expires_at) < now);
+      const owner = s.user_id ? getUserById(s.user_id) : authUser;
+      const ownerAr = owner ? getUserAutoReplyStatus(owner) : null;
+      const shouldWakeSession =
+        !isSessionExpired &&
+        s.status === 'connected' &&
+        runtime.runtime_status === 'disconnected' &&
+        (owner?.role === 'admin' || !ownerAr?.is_free_plan || ownerAr.allowed);
+      if (shouldWakeSession) {
+        void ensureConnectedSessionForUser(s.user_id || authUser.id, s.id).catch(() => {});
+      }
+      return {
+        ...sanitizeSessionForClient(s),
+        runtime_status: runtime.runtime_status,
+        has_registered_creds: runtime.has_registered_creds
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== null);
 
   return res.json({ success: true, data: enriched });
 });
